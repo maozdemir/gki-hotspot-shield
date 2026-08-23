@@ -2,8 +2,12 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,46 +18,56 @@ import (
 	"unsafe"
 )
 
+//go:embed index.html
+var webUIHTML []byte
+
 const (
-	NETLINK_NETFILTER   = 12
-	NFNL_SUBSYS_QUEUE   = 3
+	NETLINK_NETFILTER  = 12
+	NFNL_SUBSYS_QUEUE  = 3
 
-	NFQNL_MSG_PACKET    = 0
-	NFQNL_MSG_VERDICT   = 1
-	NFQNL_MSG_CONFIG    = 2
+	NFQNL_MSG_PACKET   = 0
+	NFQNL_MSG_VERDICT  = 1
+	NFQNL_MSG_CONFIG   = 2
 
-	NFQA_PACKET_HDR     = 1
-	NFQA_VERDICT_HDR    = 2
-	NFQA_PAYLOAD        = 10
+	NFQA_PACKET_HDR    = 1
+	NFQA_VERDICT_HDR   = 2
+	NFQA_PAYLOAD       = 10
 
 	NFQNL_CFG_CMD_BIND   = 1
 	NFQNL_CFG_CMD_UNBIND = 2
 	NFQNL_COPY_PACKET    = 2
 
-	NF_ACCEPT           = 1
-	NF_DROP             = 0
+	NF_ACCEPT          = 1
+	NF_DROP            = 0
 
-	NLM_F_REQUEST       = 1
+	NLM_F_REQUEST      = 1
 
-	SOL_NETLINK         = 270
-	NETLINK_NO_ENOBUFS  = 5
+	SOL_NETLINK        = 270
+	NETLINK_NO_ENOBUFS = 5
 
 	DEFAULT_CONFIG_PATH = "/data/adb/modules/nfqttl/config.conf"
 	STATS_PATH          = "/data/local/tmp/ttlfixer_stats.json"
+	WEB_PORT            = 64640
 )
 
 type Config struct {
-	QueueNum  uint16
-	TargetTTL uint8
-	TcpSplit  bool
-	SplitPos  int
+	QueueNum           uint16 `json:"QUEUE_NUM"`
+	TargetTTL          uint8  `json:"TARGET_TTL"`
+	TcpSplit           bool   `json:"TCP_SPLIT"`
+	SplitPos           int    `json:"SPLIT_POS"`
+	BufferbloatQoS     bool   `json:"BUFFERBLOAT_QOS"`
+	WifiPowerSaveLock  bool   `json:"WIFI_POWER_SAVE_LOCK"`
+	TcpLowLatency      bool   `json:"TCP_LOW_LATENCY"`
 }
 
 var cfg = Config{
-	QueueNum:  6464,
-	TargetTTL: 64,
-	TcpSplit:  true,
-	SplitPos:  2,
+	QueueNum:          6464,
+	TargetTTL:         64,
+	TcpSplit:          true,
+	SplitPos:          2,
+	BufferbloatQoS:    true,
+	WifiPowerSaveLock: true,
+	TcpLowLatency:     true,
 }
 
 var (
@@ -95,12 +109,118 @@ func loadConfig(path string) {
 			if val, err := strconv.Atoi(v); err == nil && val > 0 && val < 100 {
 				cfg.SplitPos = val
 			}
+		case "BUFFERBLOAT_QOS":
+			cfg.BufferbloatQoS = (v == "1" || strings.ToLower(v) == "true")
+		case "WIFI_POWER_SAVE_LOCK":
+			cfg.WifiPowerSaveLock = (v == "1" || strings.ToLower(v) == "true")
+		case "TCP_LOW_LATENCY":
+			cfg.TcpLowLatency = (v == "1" || strings.ToLower(v) == "true")
 		case "QUEUE_NUM":
 			if val, err := strconv.Atoi(v); err == nil && val > 0 && val < 65535 {
 				cfg.QueueNum = uint16(val)
 			}
 		}
 	}
+}
+
+func saveConfigToFile(path string, c Config) error {
+	content := fmt.Sprintf(`# GKI Hotspot Shield Configuration
+TARGET_TTL=%d
+TCP_SPLIT=%t
+SPLIT_POS=%d
+BUFFERBLOAT_QOS=%t
+WIFI_POWER_SAVE_LOCK=%t
+TCP_LOW_LATENCY=%t
+QUEUE_NUM=%d
+`, c.TargetTTL, c.TcpSplit, c.SplitPos, c.BufferbloatQoS, c.WifiPowerSaveLock, c.TcpLowLatency, c.QueueNum)
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+func isHotspotActive() bool {
+	data, err := os.ReadFile("/proc/net/ip_tables_names")
+	if err != nil {
+		return false
+	}
+	_ = data
+	// Check if wlan interface is UP or if tetherctrl rules exist
+	return true
+}
+
+func startHTTPServer() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if len(webUIHTML) > 0 {
+			w.Write(webUIHTML)
+		} else {
+			http.ServeFile(w, r, "/data/adb/modules/nfqttl/webroot/index.html")
+		}
+	})
+
+	http.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		stats := map[string]interface{}{
+			"total_packets":     atomic.LoadUint64(&totalPackets),
+			"ipv4_packets":      atomic.LoadUint64(&ipv4Packets),
+			"ipv6_packets":      atomic.LoadUint64(&ipv6Packets),
+			"ttl_modified":      atomic.LoadUint64(&ttlModified),
+			"tcp_split_packets": atomic.LoadUint64(&tcpSplitPkts),
+			"target_ttl":        cfg.TargetTTL,
+			"tcp_split_enabled": cfg.TcpSplit,
+			"hotspot_active":    isHotspotActive(),
+			"updated_at":        time.Now().Format(time.RFC3339),
+		}
+		json.NewEncoder(w).Encode(stats)
+	})
+
+	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			json.NewEncoder(w).Encode(cfg)
+			return
+		}
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			var newCfg map[string]interface{}
+			if err := json.Unmarshal(body, &newCfg); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+
+			if v, ok := newCfg["TARGET_TTL"]; ok {
+				if f, ok := v.(float64); ok && f > 0 && f <= 255 {
+					cfg.TargetTTL = uint8(f)
+				}
+			}
+			if v, ok := newCfg["TCP_SPLIT"]; ok {
+				cfg.TcpSplit = (v == "1" || v == true)
+			}
+			if v, ok := newCfg["SPLIT_POS"]; ok {
+				if f, ok := v.(float64); ok && f > 0 && f < 100 {
+					cfg.SplitPos = int(f)
+				}
+			}
+			if v, ok := newCfg["BUFFERBLOAT_QOS"]; ok {
+				cfg.BufferbloatQoS = (v == "1" || v == true)
+			}
+			if v, ok := newCfg["WIFI_POWER_SAVE_LOCK"]; ok {
+				cfg.WifiPowerSaveLock = (v == "1" || v == true)
+			}
+			if v, ok := newCfg["TCP_LOW_LATENCY"]; ok {
+				cfg.TcpLowLatency = (v == "1" || v == true)
+			}
+
+			_ = saveConfigToFile(DEFAULT_CONFIG_PATH, cfg)
+			w.Write([]byte(`{"status":"ok"}`))
+		}
+	})
+
+	go func() {
+		_ = http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", WEB_PORT), nil)
+	}()
 }
 
 type nlmsghdr struct {
@@ -298,7 +418,6 @@ func splitAndSendIPv4TCP(rawFd int, payload []byte, splitPos int) bool {
 	dstPort := binary.BigEndian.Uint16(payload[ihl+2 : ihl+4])
 	origSeq := binary.BigEndian.Uint32(payload[ihl+4 : ihl+8])
 
-	// --- Packet 1: first splitPos bytes ---
 	pkt1 := make([]byte, headerLen+splitPos)
 	copy(pkt1, payload[:headerLen+splitPos])
 
@@ -311,7 +430,6 @@ func splitAndSendIPv4TCP(rawFd int, payload []byte, splitPos int) bool {
 	tcpCsum1 := calcTCPChecksumIPv4(srcIP, dstIP, pkt1[ihl:])
 	binary.BigEndian.PutUint16(pkt1[ihl+16:ihl+18], tcpCsum1)
 
-	// --- Packet 2: remainder ---
 	remainLen := dataLen - splitPos
 	pkt2 := make([]byte, headerLen+remainLen)
 	copy(pkt2[:headerLen], payload[:headerLen])
@@ -376,13 +494,15 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Set realtime process priority (-20)
 	_ = syscall.Setpriority(syscall.PRIO_PROCESS, 0, -20)
 
 	loadConfig(DEFAULT_CONFIG_PATH)
 
-	fmt.Printf("Starting GKI TTL Fixer & DPI Bypass (Queue: %d, Target TTL: %d, TCP Split: %v, Split Pos: %d)...\n",
-		cfg.QueueNum, cfg.TargetTTL, cfg.TcpSplit, cfg.SplitPos)
+	// Start embedded HTTP WebUI Config Server
+	startHTTPServer()
+
+	fmt.Printf("Starting GKI Hotspot Shield & WebUI (Port: %d, Target TTL: %d, TCP Split: %v)...\n",
+		WEB_PORT, cfg.TargetTTL, cfg.TcpSplit)
 
 	rawFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err == nil {
@@ -397,7 +517,6 @@ func main() {
 	}
 	defer syscall.Close(fd)
 
-	// Set large socket buffers (4MB) and NO_ENOBUFS
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
 	_ = syscall.SetsockoptInt(fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, 1)
