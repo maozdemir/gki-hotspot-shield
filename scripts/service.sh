@@ -32,7 +32,7 @@ resetprop tether_entitlement_check_state 0
 settings put global tether_dun_required 0 2>/dev/null
 settings put global tether_entitlement_check_state 0 2>/dev/null
 
-# 4. Start Go TTL & DPI Fixer Daemon
+# 4. Start Go TTL, DPI & DoH Daemon
 killall -9 nfqttl ttlfixer 2>/dev/null
 $MODDIR/nfqttl > /dev/null 2>&1 &
 
@@ -52,15 +52,17 @@ iptables -t mangle -C POSTROUTING -j nfqttlo 2>/dev/null || iptables -t mangle -
 # 6. TCP MSS Clamping to PMTU
 iptables -t mangle -C FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# 7. Dynamic Hotspot-Aware QoS & Power Saver Guard
+# 7. Transparent DNS-over-HTTPS (DoH) Redirection (Port 53 -> 5353)
+iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5353
+iptables -t nat -C PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 5353
+
+# 8. Dynamic Hotspot-Aware QoS & Power Saver Guard
 (
     last_state="unknown"
     while true; do
-        # Check if hotspot / tethering is currently active
         if iptables -t nat -S tetherctrl_nat_POSTROUTING 2>/dev/null | grep -q "MASQUERADE"; then
             current_state="active"
             if [ "$last_state" != "active" ]; then
-                # Hotspot just turned ON -> Disable power save on active hotspot interfaces
                 last_state="active"
             fi
 
@@ -72,7 +74,6 @@ iptables -t mangle -C FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --
         else
             current_state="idle"
             if [ "$last_state" = "active" ]; then
-                # Hotspot just turned OFF -> Restore normal Wi-Fi power saving to preserve battery
                 for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -E 'wlan|ap'); do
                     clean_iface=$(echo "$iface" | cut -d'@' -f1)
                     iw dev "$clean_iface" set power_save on 2>/dev/null

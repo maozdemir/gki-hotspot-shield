@@ -15,6 +15,7 @@
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --danger: #ef4444;
+      --purple: #a855f7;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background-color: var(--bg); color: var(--text); padding: 16px; min-height: 100vh; }
@@ -27,10 +28,12 @@
     .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
     .stat-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; }
     .stat-label { font-size: 0.75rem; color: var(--text-muted); font-weight: 500; }
-    .stat-val { font-size: 1.4rem; font-weight: 700; margin-top: 4px; color: var(--primary); }
+    .stat-val { font-size: 1.35rem; font-weight: 700; margin-top: 4px; color: var(--primary); }
+    .stat-val.purple { color: var(--purple); }
+    .stat-val.success { color: var(--success); }
     
     .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
-    .card-title { font-size: 0.95rem; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+    .card-title { font-size: 0.95rem; font-weight: 600; color: var(--text); margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center; }
     
     .form-group { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .form-info { display: flex; flex-direction: column; gap: 2px; }
@@ -45,13 +48,14 @@
     input:checked + .slider:before { transform: translateX(20px); }
     
     .input-num { background: #0f172a; border: 1px solid var(--card-border); color: white; padding: 6px 12px; border-radius: 8px; width: 70px; text-align: center; font-size: 0.9rem; font-weight: 600; }
+    .select-input { background: #0f172a; border: 1px solid var(--card-border); color: white; padding: 6px 10px; border-radius: 8px; font-size: 0.85rem; font-weight: 500; }
     
     .btn { background: var(--primary); color: white; border: none; padding: 12px 16px; border-radius: 10px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: background 0.2s; text-align: center; }
     .btn:active { transform: scale(0.98); }
     .btn-save { background: var(--success); }
     .btn-save:hover { background: #059669; }
     
-    .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #334155; color: white; padding: 10px 20px; border-radius: 20px; font-size: 0.85rem; font-weight: 500; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+    .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #334155; color: white; padding: 10px 20px; border-radius: 20px; font-size: 0.85rem; font-weight: 500; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 999; }
     .toast.show { opacity: 1; }
   </style>
 </head>
@@ -66,10 +70,6 @@
 
     <div class="stats-grid">
       <div class="stat-card">
-        <span class="stat-label">Total Packets</span>
-        <span class="stat-val" id="totalPkts">0</span>
-      </div>
-      <div class="stat-card">
         <span class="stat-label">TTL=64 Fixed</span>
         <span class="stat-val" id="ttlFixed">0</span>
       </div>
@@ -78,13 +78,49 @@
         <span class="stat-val" id="tcpSplit">0</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">Hotspot Mode</span>
-        <span class="stat-val" id="hotspotStatus" style="font-size: 1.1rem; color: #10b981;">Checking...</span>
+        <span class="stat-label">🔒 Encrypted DoH DNS</span>
+        <span class="stat-val purple" id="dohQueries">0</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">DNS Cache Hits</span>
+        <span class="stat-val success" id="dnsCacheHits">0</span>
       </div>
     </div>
 
+    <!-- Encrypted DNS Section -->
     <div class="card">
-      <div class="card-title">Configuration Settings</div>
+      <div class="card-title">
+        <span>🔒 Transparent Encrypted DNS (DoH)</span>
+      </div>
+      
+      <div class="form-group">
+        <div class="form-info">
+          <span class="form-label">Enable DNS-over-HTTPS</span>
+          <span class="form-desc">Intercepts port 53 & resolves over HTTPS</span>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="dohToggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="form-group">
+        <div class="form-info">
+          <span class="form-label">DoH Provider</span>
+          <span class="form-desc">Upstream encrypted resolver</span>
+        </div>
+        <select id="dohProvider" class="select-input">
+          <option value="cloudflare">Cloudflare (1.1.1.1)</option>
+          <option value="quad9">Quad9 Security (9.9.9.9)</option>
+          <option value="google">Google DNS (8.8.8.8)</option>
+          <option value="adguard">AdGuard AdBlock DNS</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Network & DPI Settings -->
+    <div class="card">
+      <div class="card-title">Network & DPI Settings</div>
       
       <div class="form-group">
         <div class="form-info">
@@ -165,11 +201,10 @@
         const res = await fetch('/api/stats');
         if (res.ok) {
           const data = await res.json();
-          document.getElementById('totalPkts').innerText = data.total_packets.toLocaleString();
           document.getElementById('ttlFixed').innerText = data.ttl_modified.toLocaleString();
           document.getElementById('tcpSplit').innerText = data.tcp_split_packets.toLocaleString();
-          document.getElementById('hotspotStatus').innerText = data.hotspot_active ? 'Active' : 'Idle';
-          document.getElementById('hotspotStatus').style.color = data.hotspot_active ? '#10b981' : '#94a3b8';
+          document.getElementById('dohQueries').innerText = (data.doh_queries || 0).toLocaleString();
+          document.getElementById('dnsCacheHits').innerText = (data.dns_cache_hits || 0).toLocaleString();
         }
       } catch (e) {}
     }
@@ -185,6 +220,8 @@
           document.getElementById('qosToggle').checked = cfg.BUFFERBLOAT_QOS === "1" || cfg.BUFFERBLOAT_QOS === true;
           document.getElementById('batteryGuardToggle').checked = cfg.WIFI_POWER_SAVE_LOCK === "1" || cfg.WIFI_POWER_SAVE_LOCK === true;
           document.getElementById('lowLatencyToggle').checked = cfg.TCP_LOW_LATENCY === "1" || cfg.TCP_LOW_LATENCY === true;
+          document.getElementById('dohToggle').checked = cfg.DOH_ENABLED === "1" || cfg.DOH_ENABLED === true || cfg.DOH_ENABLED === undefined;
+          if (cfg.DOH_PROVIDER) document.getElementById('dohProvider').value = cfg.DOH_PROVIDER;
         }
       } catch (e) {}
     }
@@ -196,7 +233,9 @@
         SPLIT_POS: parseInt(document.getElementById('splitPos').value) || 2,
         BUFFERBLOAT_QOS: document.getElementById('qosToggle').checked ? "1" : "0",
         WIFI_POWER_SAVE_LOCK: document.getElementById('batteryGuardToggle').checked ? "1" : "0",
-        TCP_LOW_LATENCY: document.getElementById('lowLatencyToggle').checked ? "1" : "0"
+        TCP_LOW_LATENCY: document.getElementById('lowLatencyToggle').checked ? "1" : "0",
+        DOH_ENABLED: document.getElementById('dohToggle').checked ? "1" : "0",
+        DOH_PROVIDER: document.getElementById('dohProvider').value
       };
 
       try {
@@ -206,7 +245,7 @@
           body: JSON.stringify(body)
         });
         if (res.ok) {
-          showToast('✅ Settings applied and service reloaded!');
+          showToast('✅ Settings applied and DoH reloaded!');
         } else {
           showToast('❌ Failed to save settings');
         }

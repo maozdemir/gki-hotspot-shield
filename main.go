@@ -2,16 +2,20 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/tls"
 	_ "embed"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -48,6 +52,7 @@ const (
 	DEFAULT_CONFIG_PATH = "/data/adb/modules/nfqttl/config.conf"
 	STATS_PATH          = "/data/local/tmp/ttlfixer_stats.json"
 	WEB_PORT            = 64640
+	DNS_PORT            = 53545
 )
 
 type Config struct {
@@ -58,6 +63,8 @@ type Config struct {
 	BufferbloatQoS     bool   `json:"BUFFERBLOAT_QOS"`
 	WifiPowerSaveLock  bool   `json:"WIFI_POWER_SAVE_LOCK"`
 	TcpLowLatency      bool   `json:"TCP_LOW_LATENCY"`
+	DohEnabled         bool   `json:"DOH_ENABLED"`
+	DohProvider        string `json:"DOH_PROVIDER"`
 }
 
 var cfg = Config{
@@ -68,6 +75,8 @@ var cfg = Config{
 	BufferbloatQoS:    true,
 	WifiPowerSaveLock: true,
 	TcpLowLatency:     true,
+	DohEnabled:        true,
+	DohProvider:       "cloudflare",
 }
 
 var (
@@ -76,7 +85,179 @@ var (
 	tcpSplitPkts uint64
 	ipv4Packets  uint64
 	ipv6Packets  uint64
+	dohQueries   uint64
+	dnsCacheHits uint64
 )
+
+type dnsCacheEntry struct {
+	response  []byte
+	expiresAt time.Time
+}
+
+var (
+	dnsCache   = make(map[string]dnsCacheEntry)
+	dnsCacheMu sync.RWMutex
+)
+
+var dohClient = &http.Client{
+	Timeout: 3 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Avoid Android missing root CA bundle issues
+		},
+		DialContext: (&net.Dialer{
+			Timeout:   2 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	},
+}
+
+func getDoHURL() (string, string) {
+	switch strings.ToLower(cfg.DohProvider) {
+	case "quad9":
+		return "https://9.9.9.9/dns-query", "9.9.9.9"
+	case "google":
+		return "https://8.8.8.8/dns-query", "dns.google"
+	case "adguard":
+		return "https://94.140.14.14/dns-query", "dns.adguard-dns.com"
+	case "cloudflare":
+		fallthrough
+	default:
+		return "https://1.1.1.1/dns-query", "cloudflare-dns.com"
+	}
+}
+
+func resolveDoH(query []byte) ([]byte, error) {
+	if len(query) < 12 {
+		return nil, fmt.Errorf("query too short")
+	}
+
+	queryKey := string(query[2:])
+
+	dnsCacheMu.RLock()
+	if entry, ok := dnsCache[queryKey]; ok {
+		if time.Now().Before(entry.expiresAt) {
+			dnsCacheMu.RUnlock()
+			atomic.AddUint64(&dnsCacheHits, 1)
+			resp := make([]byte, len(entry.response))
+			copy(resp, entry.response)
+			resp[0] = query[0]
+			resp[1] = query[1]
+			return resp, nil
+		}
+	}
+	dnsCacheMu.RUnlock()
+
+	dohURL, hostHeader := getDoHURL()
+
+	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(query))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Host", hostHeader)
+
+	resp, err := dohClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("doh status %d", resp.StatusCode)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	atomic.AddUint64(&dohQueries, 1)
+
+	dnsCacheMu.Lock()
+	if len(dnsCache) > 10000 {
+		dnsCache = make(map[string]dnsCacheEntry)
+	}
+	dnsCache[queryKey] = dnsCacheEntry{
+		response:  respBody,
+		expiresAt: time.Now().Add(60 * time.Second),
+	}
+	dnsCacheMu.Unlock()
+
+	return respBody, nil
+}
+
+func startDNSServer() {
+	// UDP DNS Listener on 0.0.0.0:53545
+	go func() {
+		conn, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", DNS_PORT))
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, 4096)
+		for {
+			n, clientAddr, err := conn.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+			if !cfg.DohEnabled || n < 12 {
+				continue
+			}
+
+			qCopy := make([]byte, n)
+			copy(qCopy, buf[:n])
+
+			go func(q []byte, target net.Addr) {
+				resp, err := resolveDoH(q)
+				if err == nil && len(resp) > 0 {
+					_, _ = conn.WriteTo(resp, target)
+				}
+			}(qCopy, clientAddr)
+		}
+	}()
+
+	// TCP DNS Listener on 0.0.0.0:53545
+	go func() {
+		l, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", DNS_PORT))
+		if err != nil {
+			return
+		}
+		defer l.Close()
+
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				continue
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				var lenBuf [2]byte
+				if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
+					return
+				}
+				qLen := binary.BigEndian.Uint16(lenBuf[:])
+				q := make([]byte, qLen)
+				if _, err := io.ReadFull(c, q); err != nil {
+					return
+				}
+
+				resp, err := resolveDoH(q)
+				if err == nil && len(resp) > 0 {
+					var respLenBuf [2]byte
+					binary.BigEndian.PutUint16(respLenBuf[:], uint16(len(resp)))
+					_, _ = c.Write(respLenBuf[:])
+					_, _ = c.Write(resp)
+				}
+			}(conn)
+		}
+	}()
+}
 
 func loadConfig(path string) {
 	file, err := os.Open(path)
@@ -115,6 +296,10 @@ func loadConfig(path string) {
 			cfg.WifiPowerSaveLock = (v == "1" || strings.ToLower(v) == "true")
 		case "TCP_LOW_LATENCY":
 			cfg.TcpLowLatency = (v == "1" || strings.ToLower(v) == "true")
+		case "DOH_ENABLED":
+			cfg.DohEnabled = (v == "1" || strings.ToLower(v) == "true")
+		case "DOH_PROVIDER":
+			cfg.DohProvider = v
 		case "QUEUE_NUM":
 			if val, err := strconv.Atoi(v); err == nil && val > 0 && val < 65535 {
 				cfg.QueueNum = uint16(val)
@@ -131,19 +316,11 @@ SPLIT_POS=%d
 BUFFERBLOAT_QOS=%t
 WIFI_POWER_SAVE_LOCK=%t
 TCP_LOW_LATENCY=%t
+DOH_ENABLED=%t
+DOH_PROVIDER=%s
 QUEUE_NUM=%d
-`, c.TargetTTL, c.TcpSplit, c.SplitPos, c.BufferbloatQoS, c.WifiPowerSaveLock, c.TcpLowLatency, c.QueueNum)
+`, c.TargetTTL, c.TcpSplit, c.SplitPos, c.BufferbloatQoS, c.WifiPowerSaveLock, c.TcpLowLatency, c.DohEnabled, c.DohProvider, c.QueueNum)
 	return os.WriteFile(path, []byte(content), 0644)
-}
-
-func isHotspotActive() bool {
-	data, err := os.ReadFile("/proc/net/ip_tables_names")
-	if err != nil {
-		return false
-	}
-	_ = data
-	// Check if wlan interface is UP or if tetherctrl rules exist
-	return true
 }
 
 func startHTTPServer() {
@@ -164,9 +341,12 @@ func startHTTPServer() {
 			"ipv6_packets":      atomic.LoadUint64(&ipv6Packets),
 			"ttl_modified":      atomic.LoadUint64(&ttlModified),
 			"tcp_split_packets": atomic.LoadUint64(&tcpSplitPkts),
+			"doh_queries":       atomic.LoadUint64(&dohQueries),
+			"dns_cache_hits":    atomic.LoadUint64(&dnsCacheHits),
 			"target_ttl":        cfg.TargetTTL,
 			"tcp_split_enabled": cfg.TcpSplit,
-			"hotspot_active":    isHotspotActive(),
+			"doh_enabled":       cfg.DohEnabled,
+			"doh_provider":      cfg.DohProvider,
 			"updated_at":        time.Now().Format(time.RFC3339),
 		}
 		json.NewEncoder(w).Encode(stats)
@@ -211,6 +391,14 @@ func startHTTPServer() {
 			}
 			if v, ok := newCfg["TCP_LOW_LATENCY"]; ok {
 				cfg.TcpLowLatency = (v == "1" || v == true)
+			}
+			if v, ok := newCfg["DOH_ENABLED"]; ok {
+				cfg.DohEnabled = (v == "1" || v == true)
+			}
+			if v, ok := newCfg["DOH_PROVIDER"]; ok {
+				if s, ok := v.(string); ok && s != "" {
+					cfg.DohProvider = s
+				}
 			}
 
 			_ = saveConfigToFile(DEFAULT_CONFIG_PATH, cfg)
@@ -467,8 +655,12 @@ func writeStats() {
   "ipv6_packets": %d,
   "ttl_modified": %d,
   "tcp_split_packets": %d,
+  "doh_queries": %d,
+  "dns_cache_hits": %d,
   "target_ttl": %d,
   "tcp_split_enabled": %v,
+  "doh_enabled": %v,
+  "doh_provider": "%s",
   "updated_at": "%s"
 }`,
 		atomic.LoadUint64(&totalPackets),
@@ -476,8 +668,12 @@ func writeStats() {
 		atomic.LoadUint64(&ipv6Packets),
 		atomic.LoadUint64(&ttlModified),
 		atomic.LoadUint64(&tcpSplitPkts),
+		atomic.LoadUint64(&dohQueries),
+		atomic.LoadUint64(&dnsCacheHits),
 		cfg.TargetTTL,
 		cfg.TcpSplit,
+		cfg.DohEnabled,
+		cfg.DohProvider,
 		time.Now().Format(time.RFC3339),
 	)
 	_ = os.WriteFile(STATS_PATH, []byte(jsonContent), 0644)
@@ -498,11 +694,14 @@ func main() {
 
 	loadConfig(DEFAULT_CONFIG_PATH)
 
+	// Start embedded DoH DNS Interceptor
+	startDNSServer()
+
 	// Start embedded HTTP WebUI Config Server
 	startHTTPServer()
 
-	fmt.Printf("Starting GKI Hotspot Shield & WebUI (Port: %d, Target TTL: %d, TCP Split: %v)...\n",
-		WEB_PORT, cfg.TargetTTL, cfg.TcpSplit)
+	fmt.Printf("Starting GKI Hotspot Shield (WebUI: %d, DoH DNS: %d, Target TTL: %d, TCP Split: %v)...\n",
+		WEB_PORT, DNS_PORT, cfg.TargetTTL, cfg.TcpSplit)
 
 	rawFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err == nil {
