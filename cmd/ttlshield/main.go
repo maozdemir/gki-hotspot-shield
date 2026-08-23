@@ -1,0 +1,540 @@
+package main
+
+import (
+	"bufio"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+const (
+	NETLINK_NETFILTER   = 12
+	NFNL_SUBSYS_QUEUE   = 3
+
+	NFQNL_MSG_PACKET    = 0
+	NFQNL_MSG_VERDICT   = 1
+	NFQNL_MSG_CONFIG    = 2
+
+	NFQA_PACKET_HDR     = 1
+	NFQA_VERDICT_HDR    = 2
+	NFQA_PAYLOAD        = 10
+
+	NFQNL_CFG_CMD_BIND   = 1
+	NFQNL_CFG_CMD_UNBIND = 2
+	NFQNL_COPY_PACKET    = 2
+
+	NF_ACCEPT           = 1
+	NF_DROP             = 0
+
+	NLM_F_REQUEST       = 1
+
+	SOL_NETLINK         = 270
+	NETLINK_NO_ENOBUFS  = 5
+
+	DEFAULT_CONFIG_PATH = "/data/adb/modules/nfqttl/config.conf"
+	STATS_PATH          = "/data/local/tmp/ttlfixer_stats.json"
+)
+
+type Config struct {
+	QueueNum  uint16
+	TargetTTL uint8
+	TcpSplit  bool
+	SplitPos  int
+}
+
+var cfg = Config{
+	QueueNum:  6464,
+	TargetTTL: 64,
+	TcpSplit:  true,
+	SplitPos:  2,
+}
+
+var (
+	totalPackets uint64
+	ttlModified  uint64
+	tcpSplitPkts uint64
+	ipv4Packets  uint64
+	ipv6Packets  uint64
+)
+
+func loadConfig(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+
+		switch k {
+		case "TARGET_TTL":
+			if val, err := strconv.Atoi(v); err == nil && val > 0 && val <= 255 {
+				cfg.TargetTTL = uint8(val)
+			}
+		case "TCP_SPLIT":
+			cfg.TcpSplit = (v == "1" || strings.ToLower(v) == "true")
+		case "SPLIT_POS":
+			if val, err := strconv.Atoi(v); err == nil && val > 0 && val < 100 {
+				cfg.SplitPos = val
+			}
+		case "QUEUE_NUM":
+			if val, err := strconv.Atoi(v); err == nil && val > 0 && val < 65535 {
+				cfg.QueueNum = uint16(val)
+			}
+		}
+	}
+}
+
+type nlmsghdr struct {
+	Len   uint32
+	Type  uint16
+	Flags uint16
+	Seq   uint32
+	Pid   uint32
+}
+
+type nfgenmsg struct {
+	Family  uint8
+	Version uint8
+	ResId   uint16
+}
+
+func htons(v uint16) uint16 {
+	return (v << 8) | (v >> 8)
+}
+
+func nfaLen(attrLen int) int {
+	return (4 + attrLen + 3) & ^3
+}
+
+func appendAttr(buf []byte, attrType uint16, data []byte) []byte {
+	aLen := uint16(4 + len(data))
+	pad := nfaLen(len(data)) - int(aLen)
+	hdr := make([]byte, 4)
+	binary.LittleEndian.PutUint16(hdr[0:2], aLen)
+	binary.LittleEndian.PutUint16(hdr[2:4], attrType)
+	buf = append(buf, hdr...)
+	buf = append(buf, data...)
+	for i := 0; i < pad; i++ {
+		buf = append(buf, 0)
+	}
+	return buf
+}
+
+func sendConfig(fd int, cmd uint8, qNum uint16) error {
+	nlh := nlmsghdr{
+		Type:  uint16((NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG),
+		Flags: NLM_F_REQUEST,
+	}
+	nfg := nfgenmsg{
+		Family:  syscall.AF_UNSPEC,
+		Version: 0,
+		ResId:   htons(qNum),
+	}
+
+	cmdBuf := make([]byte, 4)
+	cmdBuf[0] = cmd
+
+	msg := make([]byte, 16+4)
+	copy(msg[16:], (*(*[4]byte)(unsafe.Pointer(&nfg)))[:])
+	msg = appendAttr(msg, 1 /* NFQA_CFG_CMD */, cmdBuf)
+
+	nlh.Len = uint32(len(msg))
+	copy(msg[0:16], (*(*[16]byte)(unsafe.Pointer(&nlh)))[:])
+
+	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
+	return syscall.Sendto(fd, msg, 0, sa)
+}
+
+func sendCopyMode(fd int, qNum uint16, mode uint8, copyRange uint32) error {
+	nlh := nlmsghdr{
+		Type:  uint16((NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG),
+		Flags: NLM_F_REQUEST,
+	}
+	nfg := nfgenmsg{
+		Family:  syscall.AF_UNSPEC,
+		Version: 0,
+		ResId:   htons(qNum),
+	}
+
+	paramBuf := make([]byte, 8)
+	binary.BigEndian.PutUint32(paramBuf[0:4], copyRange)
+	paramBuf[4] = mode
+
+	msg := make([]byte, 16+4)
+	copy(msg[16:], (*(*[4]byte)(unsafe.Pointer(&nfg)))[:])
+	msg = appendAttr(msg, 2 /* NFQA_CFG_PARAMS */, paramBuf)
+
+	nlh.Len = uint32(len(msg))
+	copy(msg[0:16], (*(*[16]byte)(unsafe.Pointer(&nlh)))[:])
+
+	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
+	return syscall.Sendto(fd, msg, 0, sa)
+}
+
+func sendVerdict(fd int, qNum uint16, packetID uint32, verdict uint32, payload []byte) error {
+	nlh := nlmsghdr{
+		Type:  uint16((NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_VERDICT),
+		Flags: NLM_F_REQUEST,
+	}
+	nfg := nfgenmsg{
+		Family:  syscall.AF_UNSPEC,
+		Version: 0,
+		ResId:   htons(qNum),
+	}
+
+	vh := make([]byte, 8)
+	binary.BigEndian.PutUint32(vh[0:4], verdict)
+	binary.BigEndian.PutUint32(vh[4:8], packetID)
+
+	msg := make([]byte, 16+4)
+	copy(msg[16:], (*(*[4]byte)(unsafe.Pointer(&nfg)))[:])
+	msg = appendAttr(msg, NFQA_VERDICT_HDR, vh)
+
+	if len(payload) > 0 {
+		msg = appendAttr(msg, NFQA_PAYLOAD, payload)
+	}
+
+	nlh.Len = uint32(len(msg))
+	copy(msg[0:16], (*(*[16]byte)(unsafe.Pointer(&nlh)))[:])
+
+	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
+	return syscall.Sendto(fd, msg, 0, sa)
+}
+
+func calcChecksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(data[i : i+2]))
+	}
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	for (sum >> 16) > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func calcTCPChecksumIPv4(srcIP, dstIP []byte, tcpSegment []byte) uint16 {
+	var sum uint32
+	sum += uint32(binary.BigEndian.Uint16(srcIP[0:2]))
+	sum += uint32(binary.BigEndian.Uint16(srcIP[2:4]))
+	sum += uint32(binary.BigEndian.Uint16(dstIP[0:2]))
+	sum += uint32(binary.BigEndian.Uint16(dstIP[2:4]))
+	sum += uint32(6) // IPPROTO_TCP
+	sum += uint32(len(tcpSegment))
+
+	for i := 0; i < len(tcpSegment)-1; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(tcpSegment[i : i+2]))
+	}
+	if len(tcpSegment)%2 == 1 {
+		sum += uint32(tcpSegment[len(tcpSegment)-1]) << 8
+	}
+
+	for (sum >> 16) > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func isTLSClientHello(payload []byte) bool {
+	if len(payload) < 6 {
+		return false
+	}
+	if payload[0] == 0x16 && payload[1] == 0x03 && (payload[2] >= 0x00 && payload[2] <= 0x04) {
+		if payload[5] == 0x01 {
+			return true
+		}
+	}
+	return false
+}
+
+func isHTTPRequest(payload []byte) bool {
+	if len(payload) < 4 {
+		return false
+	}
+	s := string(payload[:4])
+	return s == "GET " || s == "POST" || s == "HEAD" || s == "PUT " || s == "OPTI"
+}
+
+func splitAndSendIPv4TCP(rawFd int, payload []byte, splitPos int) bool {
+	if len(payload) < 40 {
+		return false
+	}
+	ihl := int(payload[0]&0x0F) * 4
+	if len(payload) < ihl+20 {
+		return false
+	}
+	tcphl := int((payload[ihl+12] >> 4) & 0x0F) * 4
+	headerLen := ihl + tcphl
+	dataLen := len(payload) - headerLen
+
+	if dataLen <= splitPos || splitPos <= 0 {
+		return false
+	}
+
+	srcIP := payload[12:16]
+	dstIP := payload[16:20]
+	dstAddr := [4]byte{dstIP[0], dstIP[1], dstIP[2], dstIP[3]}
+	dstPort := binary.BigEndian.Uint16(payload[ihl+2 : ihl+4])
+	origSeq := binary.BigEndian.Uint32(payload[ihl+4 : ihl+8])
+
+	// --- Packet 1: first splitPos bytes ---
+	pkt1 := make([]byte, headerLen+splitPos)
+	copy(pkt1, payload[:headerLen+splitPos])
+
+	binary.BigEndian.PutUint16(pkt1[2:4], uint16(len(pkt1)))
+	pkt1[8] = cfg.TargetTTL
+	pkt1[10], pkt1[11] = 0, 0
+	binary.BigEndian.PutUint16(pkt1[10:12], calcChecksum(pkt1[:ihl]))
+
+	pkt1[ihl+16], pkt1[ihl+17] = 0, 0
+	tcpCsum1 := calcTCPChecksumIPv4(srcIP, dstIP, pkt1[ihl:])
+	binary.BigEndian.PutUint16(pkt1[ihl+16:ihl+18], tcpCsum1)
+
+	// --- Packet 2: remainder ---
+	remainLen := dataLen - splitPos
+	pkt2 := make([]byte, headerLen+remainLen)
+	copy(pkt2[:headerLen], payload[:headerLen])
+	copy(pkt2[headerLen:], payload[headerLen+splitPos:])
+
+	binary.BigEndian.PutUint32(pkt2[ihl+4:ihl+8], origSeq+uint32(splitPos))
+	binary.BigEndian.PutUint16(pkt2[2:4], uint16(len(pkt2)))
+	pkt2[8] = cfg.TargetTTL
+	pkt2[10], pkt2[11] = 0, 0
+	binary.BigEndian.PutUint16(pkt2[10:12], calcChecksum(pkt2[:ihl]))
+
+	pkt2[ihl+16], pkt2[ihl+17] = 0, 0
+	tcpCsum2 := calcTCPChecksumIPv4(srcIP, dstIP, pkt2[ihl:])
+	binary.BigEndian.PutUint16(pkt2[ihl+16:ihl+18], tcpCsum2)
+
+	sa := &syscall.SockaddrInet4{
+		Port: int(dstPort),
+		Addr: dstAddr,
+	}
+
+	if err := syscall.Sendto(rawFd, pkt1, 0, sa); err != nil {
+		return false
+	}
+	if err := syscall.Sendto(rawFd, pkt2, 0, sa); err != nil {
+		return false
+	}
+
+	return true
+}
+
+func writeStats() {
+	jsonContent := fmt.Sprintf(`{
+  "total_packets": %d,
+  "ipv4_packets": %d,
+  "ipv6_packets": %d,
+  "ttl_modified": %d,
+  "tcp_split_packets": %d,
+  "target_ttl": %d,
+  "tcp_split_enabled": %v,
+  "updated_at": "%s"
+}`,
+		atomic.LoadUint64(&totalPackets),
+		atomic.LoadUint64(&ipv4Packets),
+		atomic.LoadUint64(&ipv6Packets),
+		atomic.LoadUint64(&ttlModified),
+		atomic.LoadUint64(&tcpSplitPkts),
+		cfg.TargetTTL,
+		cfg.TcpSplit,
+		time.Now().Format(time.RFC3339),
+	)
+	_ = os.WriteFile(STATS_PATH, []byte(jsonContent), 0644)
+}
+
+func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "status" || os.Args[1] == "-status" || os.Args[1] == "--status") {
+		data, err := os.ReadFile(STATS_PATH)
+		if err != nil {
+			fmt.Println("No stats available. Is ttlfixer running?")
+			os.Exit(1)
+		}
+		fmt.Println(string(data))
+		os.Exit(0)
+	}
+
+	// Set realtime process priority (-20)
+	_ = syscall.Setpriority(syscall.PRIO_PROCESS, 0, -20)
+
+	loadConfig(DEFAULT_CONFIG_PATH)
+
+	fmt.Printf("Starting GKI TTL Fixer & DPI Bypass (Queue: %d, Target TTL: %d, TCP Split: %v, Split Pos: %d)...\n",
+		cfg.QueueNum, cfg.TargetTTL, cfg.TcpSplit, cfg.SplitPos)
+
+	rawFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	if err == nil {
+		_ = syscall.SetsockoptInt(rawFd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+		defer syscall.Close(rawFd)
+	}
+
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, NETLINK_NETFILTER)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Netlink socket creation failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer syscall.Close(fd)
+
+	// Set large socket buffers (4MB) and NO_ENOBUFS
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
+	_ = syscall.SetsockoptInt(fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, 1)
+
+	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
+	if err := syscall.Bind(fd, sa); err != nil {
+		fmt.Fprintf(os.Stderr, "Bind failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	sendConfig(fd, NFQNL_CFG_CMD_UNBIND, cfg.QueueNum)
+	if err := sendConfig(fd, NFQNL_CFG_CMD_BIND, cfg.QueueNum); err != nil {
+		fmt.Fprintf(os.Stderr, "Bind to queue %d failed: %v\n", cfg.QueueNum, err)
+		os.Exit(1)
+	}
+
+	if err := sendCopyMode(fd, cfg.QueueNum, NFQNL_COPY_PACKET, 0xffff); err != nil {
+		fmt.Fprintf(os.Stderr, "Set copy mode failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("NFQUEUE initialized successfully. Running...")
+
+	ticker := time.NewTicker(3 * time.Second)
+	go func() {
+		for range ticker.C {
+			writeStats()
+		}
+	}()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		writeStats()
+		sendConfig(fd, NFQNL_CFG_CMD_UNBIND, cfg.QueueNum)
+		os.Exit(0)
+	}()
+
+	recvBuf := make([]byte, 65536)
+	for {
+		n, _, err := syscall.Recvfrom(fd, recvBuf, 0)
+		if err != nil {
+			if err == syscall.ENOBUFS {
+				continue
+			}
+			break
+		}
+
+		offset := 0
+		for offset < n {
+			if offset+16 > n {
+				break
+			}
+			msgLen := int(binary.LittleEndian.Uint32(recvBuf[offset : offset+4]))
+			if msgLen < 16 || offset+msgLen > n {
+				break
+			}
+
+			msgType := binary.LittleEndian.Uint16(recvBuf[offset+4 : offset+6])
+			if msgType == uint16((NFNL_SUBSYS_QUEUE<<8)|NFQNL_MSG_PACKET) {
+				atomic.AddUint64(&totalPackets, 1)
+
+				attrOffset := offset + 20
+				attrEnd := offset + msgLen
+
+				var packetID uint32
+				var payload []byte
+
+				for attrOffset+4 <= attrEnd {
+					aLen := int(binary.LittleEndian.Uint16(recvBuf[attrOffset : attrOffset+2]))
+					aType := binary.LittleEndian.Uint16(recvBuf[attrOffset+2 : attrOffset+4]) & 0x7fff
+					if aLen < 4 || attrOffset+aLen > attrEnd {
+						break
+					}
+
+					data := recvBuf[attrOffset+4 : attrOffset+aLen]
+					if aType == NFQA_PACKET_HDR && len(data) >= 4 {
+						packetID = binary.BigEndian.Uint32(data[0:4])
+					} else if aType == NFQA_PAYLOAD {
+						payload = data
+					}
+
+					attrOffset += (aLen + 3) & ^3
+				}
+
+				if packetID != 0 && len(payload) > 0 {
+					version := payload[0] >> 4
+
+					if version == 4 && len(payload) >= 20 {
+						atomic.AddUint64(&ipv4Packets, 1)
+						ihl := int(payload[0]&0x0F) * 4
+						proto := payload[9]
+
+						if cfg.TcpSplit && proto == 6 && rawFd > 0 && len(payload) > ihl+20 {
+							tcphl := int((payload[ihl+12] >> 4) & 0x0F) * 4
+							tcpPayload := payload[ihl+tcphl:]
+							if isTLSClientHello(tcpPayload) || isHTTPRequest(tcpPayload) {
+								if splitAndSendIPv4TCP(rawFd, payload, cfg.SplitPos) {
+									atomic.AddUint64(&tcpSplitPkts, 1)
+									atomic.AddUint64(&ttlModified, 1)
+									sendVerdict(fd, cfg.QueueNum, packetID, NF_DROP, nil)
+									offset += (msgLen + 3) & ^3
+									continue
+								}
+							}
+						}
+
+						currentTTL := payload[8]
+						if currentTTL != cfg.TargetTTL {
+							payload[8] = cfg.TargetTTL
+							payload[10] = 0
+							payload[11] = 0
+							newCsum := calcChecksum(payload[0:ihl])
+							binary.BigEndian.PutUint16(payload[10:12], newCsum)
+							atomic.AddUint64(&ttlModified, 1)
+							sendVerdict(fd, cfg.QueueNum, packetID, NF_ACCEPT, payload)
+						} else {
+							sendVerdict(fd, cfg.QueueNum, packetID, NF_ACCEPT, nil)
+						}
+					} else if version == 6 && len(payload) >= 40 {
+						atomic.AddUint64(&ipv6Packets, 1)
+						currentHL := payload[7]
+						if currentHL != cfg.TargetTTL {
+							payload[7] = cfg.TargetTTL
+							atomic.AddUint64(&ttlModified, 1)
+							sendVerdict(fd, cfg.QueueNum, packetID, NF_ACCEPT, payload)
+						} else {
+							sendVerdict(fd, cfg.QueueNum, packetID, NF_ACCEPT, nil)
+						}
+					} else {
+						sendVerdict(fd, cfg.QueueNum, packetID, NF_ACCEPT, nil)
+					}
+				}
+			}
+
+			offset += (msgLen + 3) & ^3
+		}
+	}
+}
