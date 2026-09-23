@@ -2,7 +2,7 @@ SKIPUNZIP=0
 
 ui_print "*****************************************"
 ui_print "*   GKI Hotspot Shield & TTL/DPI Fixer  *"
-ui_print "*                  v3.1                 *"
+ui_print "*                  v3.3                 *"
 ui_print "*             by alperozd               *"
 ui_print "*****************************************"
 
@@ -11,6 +11,11 @@ set_perm "$MODPATH/nfqttl" 0 0 0755
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/system/bin/ttlshield" 0 0 0755
+
+ui_print "- Installing mini config companion app (zero drawer icon)..."
+if [ -f "$MODPATH/HotspotShieldManager.apk" ]; then
+    pm install -r "$MODPATH/HotspotShieldManager.apk" >/dev/null 2>&1
+fi
 
 ui_print "- Initializing service..."
 killall -9 nfqttl ttlfixer 2>/dev/null

@@ -31,7 +31,7 @@ jobs:
           # 1. Read version from module.prop
           VERSION=$(grep "^version=" module.prop | head -n1 | cut -d'=' -f2 | tr -d '\r')
           if [ -z "$VERSION" ]; then
-            VERSION="v3.1"
+            VERSION="v3.3"
           fi
           if [[ ! "$VERSION" =~ ^v ]]; then
             TAG="v$VERSION"
@@ -64,9 +64,9 @@ jobs:
           mkdir -p system/bin webroot
           cp scripts/ttlshield system/bin/ttlshield
           cp index.html webroot/index.html
-          chmod +x nfqttl service.sh customize.sh action.sh system/bin/ttlshield
+          chmod +x nfqttl service.sh customize.sh action.sh uninstall.sh system/bin/ttlshield 2>/dev/null || true
           ZIP_NAME="GKI_Hotspot_Shield_${{ steps.release_info.outputs.TAG }}.zip"
-          zip -r9 "$ZIP_NAME" module.prop config.conf service.sh customize.sh action.sh nfqttl system webroot META-INF
+          zip -r9 "$ZIP_NAME" module.prop config.conf service.sh customize.sh action.sh uninstall.sh HotspotShieldManager.apk nfqttl system webroot META-INF
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
       - name: Create or Update GitHub Release
