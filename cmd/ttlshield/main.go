@@ -106,7 +106,7 @@ var dohClient = &http.Client{
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // Avoid Android missing root CA bundle issues
+			InsecureSkipVerify: true,
 		},
 		DialContext: (&net.Dialer{
 			Timeout:   2 * time.Second,
@@ -128,6 +128,27 @@ func getDoHURL() (string, string) {
 	default:
 		return "https://1.1.1.1/dns-query", "cloudflare-dns.com"
 	}
+}
+
+// resolveFallbackUDP forwards to 1.1.1.1:53 if DoH fails or times out
+func resolveFallbackUDP(query []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("udp", "1.1.1.1:53", 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
 }
 
 func resolveDoH(query []byte) ([]byte, error) {
@@ -154,41 +175,38 @@ func resolveDoH(query []byte) ([]byte, error) {
 	dohURL, hostHeader := getDoHURL()
 
 	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(query))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/dns-message")
-	req.Header.Set("Accept", "application/dns-message")
-	req.Header.Set("Host", hostHeader)
+	if err == nil {
+		req.Header.Set("Content-Type", "application/dns-message")
+		req.Header.Set("Accept", "application/dns-message")
+		req.Header.Set("Host", hostHeader)
 
-	resp, err := dohClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		resp, err := dohClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			respBody, err := io.ReadAll(resp.Body)
+			if err == nil && len(respBody) > 0 {
+				atomic.AddUint64(&dohQueries, 1)
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("doh status %d", resp.StatusCode)
+				dnsCacheMu.Lock()
+				if len(dnsCache) > 10000 {
+					dnsCache = make(map[string]dnsCacheEntry)
+				}
+				dnsCache[queryKey] = dnsCacheEntry{
+					response:  respBody,
+					expiresAt: time.Now().Add(60 * time.Second),
+				}
+				dnsCacheMu.Unlock()
+
+				return respBody, nil
+			}
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	atomic.AddUint64(&dohQueries, 1)
-
-	dnsCacheMu.Lock()
-	if len(dnsCache) > 10000 {
-		dnsCache = make(map[string]dnsCacheEntry)
-	}
-	dnsCache[queryKey] = dnsCacheEntry{
-		response:  respBody,
-		expiresAt: time.Now().Add(60 * time.Second),
-	}
-	dnsCacheMu.Unlock()
-
-	return respBody, nil
+	// Fallback to direct UDP DNS if DoH failed
+	return resolveFallbackUDP(query)
 }
 
 func startDNSServer() {
@@ -716,8 +734,8 @@ func main() {
 	}
 	defer syscall.Close(fd)
 
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 8*1024*1024)
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 8*1024*1024)
 	_ = syscall.SetsockoptInt(fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, 1)
 
 	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
@@ -810,16 +828,24 @@ func main() {
 						ihl := int(payload[0]&0x0F) * 4
 						proto := payload[9]
 
+						// CRITICAL FIX: Only apply TCP Split / DPI Evasion to standard Web HTTP/HTTPS ports!
+						// BitTorrent and P2P protocols transfer arbitrary binary chunks that can false-positive
+						// as HTTP or TLS signatures. Splitting non-web traffic corrupts torrent data blocks!
 						if cfg.TcpSplit && proto == 6 && rawFd > 0 && len(payload) > ihl+20 {
-							tcphl := int((payload[ihl+12] >> 4) & 0x0F) * 4
-							tcpPayload := payload[ihl+tcphl:]
-							if isTLSClientHello(tcpPayload) || isHTTPRequest(tcpPayload) {
-								if splitAndSendIPv4TCP(rawFd, payload, cfg.SplitPos) {
-									atomic.AddUint64(&tcpSplitPkts, 1)
-									atomic.AddUint64(&ttlModified, 1)
-									sendVerdict(fd, cfg.QueueNum, packetID, NF_DROP, nil)
-									offset += (msgLen + 3) & ^3
-									continue
+							dstPort := binary.BigEndian.Uint16(payload[ihl+2 : ihl+4])
+							isWebPort := (dstPort == 80 || dstPort == 443 || dstPort == 8080 || dstPort == 8443)
+
+							if isWebPort {
+								tcphl := int((payload[ihl+12] >> 4) & 0x0F) * 4
+								tcpPayload := payload[ihl+tcphl:]
+								if isTLSClientHello(tcpPayload) || isHTTPRequest(tcpPayload) {
+									if splitAndSendIPv4TCP(rawFd, payload, cfg.SplitPos) {
+										atomic.AddUint64(&tcpSplitPkts, 1)
+										atomic.AddUint64(&ttlModified, 1)
+										sendVerdict(fd, cfg.QueueNum, packetID, NF_DROP, nil)
+										offset += (msgLen + 3) & ^3
+										continue
+									}
 								}
 							}
 						}
