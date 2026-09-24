@@ -2,7 +2,7 @@ SKIPUNZIP=0
 
 ui_print "*****************************************"
 ui_print "*   GKI Hotspot Shield & TTL/DPI Fixer  *"
-ui_print "*                  v3.3                 *"
+ui_print "*                  v3.5                 *"
 ui_print "*             by alperozd               *"
 ui_print "*****************************************"
 
@@ -15,6 +15,10 @@ set_perm "$MODPATH/system/bin/ttlshield" 0 0 0755
 ui_print "- Installing mini config companion app (zero drawer icon)..."
 if [ -f "$MODPATH/HotspotShieldManager.apk" ]; then
     pm install -r "$MODPATH/HotspotShieldManager.apk" >/dev/null 2>&1
+    cmd appops set com.alperozd.hotspotshield 10021 allow 2>/dev/null
+    cmd appops set com.alperozd.hotspotshield 10022 allow 2>/dev/null
+    cmd appops set com.alperozd.hotspotshield 10008 allow 2>/dev/null
+    cmd appops set com.alperozd.hotspotshield SYSTEM_ALERT_WINDOW allow 2>/dev/null
 fi
 
 ui_print "- Initializing service..."
