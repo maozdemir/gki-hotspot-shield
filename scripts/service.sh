@@ -38,7 +38,7 @@ settings put global tether_entitlement_check_state 0 2>/dev/null
 
 # 4. Start Go TTL, DPI & DoH Daemon
 killall -9 nfqttl ttlfixer 2>/dev/null
-$MODDIR/nfqttl > /dev/null 2>&1 &
+nohup $MODDIR/nfqttl </dev/null >/dev/null 2>&1 &
 
 # 5. High-Efficiency NFQUEUE Mangle Rules
 # Clean old chains and rules to prevent duplicate queuing
@@ -48,12 +48,16 @@ iptables -t mangle -D POSTROUTING -j nfqttlo 2>/dev/null
 iptables -t mangle -F nfqttli 2>/dev/null
 iptables -t mangle -X nfqttli 2>/dev/null
 
-# Create dedicated chain that ONLY intercepts packets whose TTL != 64
+# Create dedicated chain:
+# 1) Intercept ports 80, 443 for GoodbyeDPI / TLS SNI splitting
+# 2) Intercept non-64 TTL packets for real-time TTL normalization
+# 3) Completely bypass BitTorrent, gaming UDP, and bulk file downloads
 iptables -t mangle -N nfqttlo 2>/dev/null
 iptables -t mangle -F nfqttlo
+iptables -t mangle -A nfqttlo -p tcp -m multiport --dports 80,443 -j NFQUEUE --queue-num 6464 --queue-bypass
 iptables -t mangle -A nfqttlo -m ttl ! --ttl-eq 64 -j NFQUEUE --queue-num 6464 --queue-bypass
 
-# Apply only in POSTROUTING on outgoing WAN (cellular) interfaces
+# Apply in POSTROUTING on outgoing WAN (cellular) interfaces
 iptables -t mangle -C POSTROUTING -o rmnet+ -j nfqttlo 2>/dev/null || iptables -t mangle -A POSTROUTING -o rmnet+ -j nfqttlo
 iptables -t mangle -C POSTROUTING -o rmnet_data+ -j nfqttlo 2>/dev/null || iptables -t mangle -A POSTROUTING -o rmnet_data+ -j nfqttlo
 
@@ -94,4 +98,4 @@ iptables -t nat -C PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 53545 2>/
         fi
         sleep 5
     done
-) > /dev/null 2>&1 &
+) </dev/null >/dev/null 2>&1 &
